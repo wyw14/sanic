@@ -62,6 +62,11 @@ class WebSocketProtocol(HttpProtocol):
         self.log_websocket("CLOSE")
         self.websocket_url = None
         self.websocket_peer = None
+        # Detach the ended connection. If this protocol instance is ever
+        # reused (or stray callbacks arrive afterwards), a new websocket
+        # handshake builds a fresh impl with its own timers and cannot
+        # inherit the previous connection's heartbeat tasks.
+        self.websocket = None
 
     def data_received(self, data):
         if self.websocket is not None:

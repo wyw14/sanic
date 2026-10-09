@@ -1,6 +1,7 @@
 import asyncio
 import secrets
 
+from asyncio import wait_for as _wait_for
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 
 from websockets.exceptions import (
@@ -135,7 +136,9 @@ class WebsocketImplProtocol:
             # This catch is for mypy type checker
             # to assert loop is not None here.
             raise ServerError("Connection received with no asyncio loop.")
-        if self.auto_closer_task:
+        # A new connection must never inherit tasks (heartbeat or closer)
+        # left over from a previous connection on the same object.
+        if self.auto_closer_task or self.keepalive_ping_task:
             raise ServerError(
                 "Cannot call connection_made more than once "
                 "on a websocket connection."
@@ -146,10 +149,10 @@ class WebsocketImplProtocol:
         self.data_finished_fut = asyncio.shield(self.loop.create_future())
 
         if self.ping_interval:
-            self.keepalive_ping_task = asyncio.create_task(
+            self.keepalive_ping_task = self.loop.create_task(
                 self.keepalive_ping()
             )
-        self.auto_closer_task = asyncio.create_task(
+        self.auto_closer_task = self.loop.create_task(
             self.auto_close_connection()
         )
 
@@ -213,11 +216,53 @@ class WebsocketImplProtocol:
             for ping_id in ping_ids:
                 del self.pings[ping_id]
 
+    def _stop_keepalive(self) -> None:
+        """
+        Stop the heartbeat: cancel the keepalive ping task (if it belongs
+        to another task) and clear it so no new pings can be scheduled.
+        """
+        task = self.keepalive_ping_task
+        if task is None:
+            return
+        if task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self.keepalive_ping_task = None
+
+    async def _wait_for_pong(
+        self, pong_waiter: asyncio.Future
+    ) -> bool:
+        """
+        Wait for the pong answering a keepalive ping.
+
+        Return ``True`` if a valid pong was received and ``False`` if the
+        ping timed out. A pong processed in the same event-loop turn in
+        which the timeout fires still counts as received: the timeout
+        cancellation only reaches the ``shield()`` wrapper, so the raw
+        pong future is re-checked after yielding once. A late timeout
+        must never override an already received, valid pong.
+        """
+        try:
+            await _wait_for(
+                asyncio.shield(pong_waiter), self.ping_timeout
+            )
+            return True
+        except asyncio.TimeoutError:
+            # Give a pong delivered concurrently with the deadline a
+            # chance to be processed before declaring the timeout.
+            await asyncio.sleep(0)
+            return (
+                pong_waiter.done()
+                and not pong_waiter.cancelled()
+                and pong_waiter.exception() is None
+            )
+
     async def keepalive_ping(self) -> None:
         """
         Send a Ping frame and wait for a Pong frame at regular intervals.
         This coroutine exits when the connection terminates and one of the
         following happens:
+        - a pong is not received in time and :meth:`fail_connection`
+          sends a single close frame carrying the timeout reason;
         - :meth:`ping` raises :exc:`ConnectionClosed`, or
         - :meth:`auto_close_connection` cancels :attr:`keepalive_ping_task`.
         """
@@ -234,17 +279,38 @@ class WebsocketImplProtocol:
                 # ping() raises ConnectionClosed if the connection is lost,
                 # when connection_lost() calls abort_pings().
 
-                ping_waiter = await self.ping()
+                # Do not start a new heartbeat once the connection is
+                # shutting down for any reason.
+                if self.ws_proto.state is not OPEN:
+                    break
 
-                if self.ping_timeout is not None:
-                    try:
-                        await asyncio.wait_for(ping_waiter, self.ping_timeout)
-                    except asyncio.TimeoutError:
-                        websockets_logger.warning(
-                            "Websocket timed out waiting for pong"
-                        )
-                        self.fail_connection(1011)
-                        break
+                # Use the raw pong future (not the shielded copy returned
+                # by ping()) so a pong that races the timeout can still be
+                # recognized as a valid reply.
+                async with self.conn_mutex:
+                    pong_waiter = await self._send_ping()
+
+                if self.ping_timeout is None:
+                    continue
+
+                if await self._wait_for_pong(pong_waiter):
+                    continue
+
+                # The connection may have been lost or closed while the
+                # pong was outstanding; that path is handled separately,
+                # do not mislabel it as a heartbeat timeout.
+                if self.ws_proto.state is not OPEN:
+                    break
+
+                websockets_logger.warning(
+                    "Websocket timed out waiting for pong; failing the "
+                    "connection (code 1011, reason='keepalive ping timeout')"
+                )
+                # fail_connection() sends exactly one close frame (only
+                # while the connection is OPEN) carrying the reason and
+                # stops the keepalive loop from scheduling new heartbeats.
+                self.fail_connection(1011, "keepalive ping timeout")
+                break
         except asyncio.CancelledError:
             # It is expected for this task to be cancelled during during
             # normal operation, when the connection is closed.
@@ -271,9 +337,7 @@ class WebsocketImplProtocol:
         if self.data_finished_fut and not self.data_finished_fut.done():
             self.data_finished_fut.cancel()
             self.data_finished_fut = None
-        if self.keepalive_ping_task and not self.keepalive_ping_task.done():
-            self.keepalive_ping_task.cancel()
-            self.keepalive_ping_task = None
+        self._stop_keepalive()
         if self.loop and self.io_proto and self.io_proto.transport:
             self.io_proto.transport.close()
             self.loop.call_later(
@@ -329,6 +393,8 @@ class WebsocketImplProtocol:
         if code == 1006:
             # Special case: 1006 consider the transport already closed
             self.ws_proto.state = CLOSED
+        # No new heartbeat may be sent once the connection is failing.
+        self._stop_keepalive()
         if self.data_finished_fut and not self.data_finished_fut.done():
             # We have a graceful auto-closer. Use it to close the connection.
             self.data_finished_fut.cancel()
@@ -345,11 +411,23 @@ class WebsocketImplProtocol:
         if code == 1006 or not self.io_proto or not self.io_proto.transport:
             return self.fail_connection(code, reason)
 
+        # No new heartbeat may be sent once the connection is closing.
+        self._stop_keepalive()
+
         # Stop new data coming in
         # In Python Version 3.7: pause_reading is idempotent
         # i.e. it can be called when the transport is already paused or closed.
         self.io_proto.transport.pause_reading()
         if self.ws_proto.state == OPEN:
+            # The server/application is proactively initiating the close.
+            # Only record this while OPEN so a close already initiated by
+            # the peer or by an earlier call isn't logged twice.
+            websockets_logger.info(
+                "Websocket connection closed by server "
+                "(code=%s, reason=%r)",
+                code,
+                reason,
+            )
             data_to_send = self.ws_proto.data_to_send()
             self.ws_proto.send_close(code, reason)
             data_to_send.extend(self.ws_proto.data_to_send())
@@ -737,39 +815,52 @@ class WebsocketImplProtocol:
         overridden with the optional ``data`` argument which must be a string
         (which will be encoded to UTF-8) or a bytes-like object.
         """
+        # Shield the future handed to user code so that cancelling a
+        # caller's await never cancels the internal pong future.
         async with self.conn_mutex:
-            if self.ws_proto.state in (CLOSED, CLOSING):
-                raise WebsocketClosed(
-                    "Cannot send a ping when the websocket interface "
-                    "is closed."
-                )
-            if (not self.io_proto) or (not self.io_proto.loop):
-                raise ServerError(
-                    "Cannot send a ping when the websocket has no I/O "
-                    "protocol attached."
-                )
-            if data is not None:
-                if isinstance(data, str):
-                    data = data.encode("utf-8")
-                elif isinstance(data, (bytearray, memoryview)):
-                    data = bytes(data)
+            pong_waiter = await self._send_ping(data)
+        return asyncio.shield(pong_waiter)
 
-            # Protect against duplicates if a payload is explicitly set.
-            if data in self.pings:
-                raise ValueError(
-                    "already waiting for a pong with the same data"
-                )
+    async def _send_ping(
+        self, data: Data | None = None
+    ) -> asyncio.Future:
+        """
+        Build, register and send a ping, returning the raw (unshielded)
+        future completed when the matching pong arrives. The caller is
+        responsible for holding :attr:`conn_mutex`.
+        """
+        if self.ws_proto.state in (CLOSED, CLOSING):
+            raise WebsocketClosed(
+                "Cannot send a ping when the websocket interface "
+                "is closed."
+            )
+        if (not self.io_proto) or (not self.io_proto.loop):
+            raise ServerError(
+                "Cannot send a ping when the websocket has no I/O "
+                "protocol attached."
+            )
+        if data is not None:
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            elif isinstance(data, (bytearray, memoryview)):
+                data = bytes(data)
 
-            # Generate a unique random payload otherwise.
-            while data is None or data in self.pings:
-                data = secrets.token_bytes(4)
+        # Protect against duplicates if a payload is explicitly set.
+        if data in self.pings:
+            raise ValueError(
+                "already waiting for a pong with the same data"
+            )
 
-            self.pings[data] = self.io_proto.loop.create_future()
+        # Generate a unique random payload otherwise.
+        while data is None or data in self.pings:
+            data = secrets.token_bytes(4)
 
-            self.ws_proto.send_ping(data)
-            await self.send_data(self.ws_proto.data_to_send())
+        self.pings[data] = self.io_proto.loop.create_future()
 
-            return asyncio.shield(self.pings[data])
+        self.ws_proto.send_ping(data)
+        await self.send_data(self.ws_proto.data_to_send())
+
+        return self.pings[data]
 
     async def pong(self, data: Data = b"") -> None:
         """
@@ -861,13 +952,31 @@ class WebsocketImplProtocol:
         The WebSocket Connection is Closed.
         """
         if not self.ws_proto.state == CLOSED:
+            # The transport disappeared without a completed closing
+            # handshake: this is an abnormal network disconnect,
+            # distinct from a server-initiated close or a keepalive
+            # timeout.
+            detail = (
+                f"{type(exc).__name__}: {exc}"
+                if exc
+                else "transport closed without a close frame"
+            )
+            websockets_logger.warning(
+                "Websocket connection lost unexpectedly: %s", detail
+            )
             # signal to the websocket connection handler
             # we've lost the connection
             self.ws_proto.fail(code=1006)
             self.ws_proto.state = CLOSED
 
+        # The heartbeat belongs to this connection and dies with it,
+        # so its timer can never govern a later connection.
+        self._stop_keepalive()
         self.abort_pings()
-        if self.connection_lost_waiter:
+        if (
+            self.connection_lost_waiter
+            and not self.connection_lost_waiter.done()
+        ):
             self.connection_lost_waiter.set_result(None)
 
     async def __aiter__(self):
