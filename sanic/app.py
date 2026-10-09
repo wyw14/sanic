@@ -1196,6 +1196,26 @@ class Sanic(
                     "https://sanicframework.org/en/guide/advanced/"
                     "signals.html",
                 )
+
+            # The response has already been committed, so the status
+            # code and headers cannot be changed. End the current
+            # response and let the normal cleanup proceed.
+            if (
+                request.stream.stage in (Stage.RESPONSE, Stage.FAILED)
+                and request.stream.response is not None
+            ):
+                try:
+                    await request.stream.response.send(end_stream=True)
+                except CancelledError:
+                    logger.info(
+                        "Request cancelled before the response could "
+                        "be ended. The client disconnected."
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not end the committed response",
+                        exc_info=True,
+                    )
             return
 
         # -------------------------------------------- #

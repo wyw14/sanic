@@ -131,10 +131,9 @@ class Http(Stream, metaclass=TouchUpMeta):
             except CancelledError as exc:
                 # Write an appropriate response before exiting
                 if not self.protocol.transport:
-                    logger.info(
-                        f"Request: {self.request.method} {self.request.url} "
-                        "stopped. Transport is closed."
-                    )
+                    # The application stopped and the transport has
+                    # already been closed or aborted
+                    self.log_stopped()
                     return
                 e = (
                     RequestCancelled()
@@ -393,6 +392,8 @@ class Http(Stream, metaclass=TouchUpMeta):
             )
             self.response_func = None
             self.stage = Stage.IDLE
+            if not size:
+                logger.debug("Response ended normally with an empty body")
         elif size:
             await self._send(b"%x\r\n%b\r\n" % (size, data))
 
@@ -408,6 +409,7 @@ class Http(Stream, metaclass=TouchUpMeta):
             await self._send(data)
             self.response_func = None
             self.stage = Stage.IDLE
+            logger.debug("Response ended normally")
         else:
             if end_stream:
                 raise ServerError("Response was smaller than content-length")
@@ -441,6 +443,47 @@ class Http(Stream, metaclass=TouchUpMeta):
                 )
             except Exception as e:
                 await app.handle_exception(self.request, e, False)
+        elif (
+            self.stage in (Stage.RESPONSE, Stage.FAILED)
+            and self.response is not None
+        ):
+            # The response headers have already been committed, so
+            # the status code and headers stay unchanged. The error
+            # can only end the current response and let cleanup proceed.
+            await self.end_response(exception)
+
+    async def end_response(self, exception: Exception) -> None:
+        """End an already committed response without altering it.
+
+        The status code and headers have been sent to the client and
+        cannot be modified. Any error occurring afterwards can only
+        end the current response and let the normal cleanup proceed.
+        """
+        try:
+            await self.response.send(end_stream=True)
+        except CancelledError:
+            # Client disconnected while the response was being ended
+            if self.request is not None:
+                logger.info(
+                    f"Request: {self.request.method} {self.request.url} "
+                    "cancelled. The client disconnected."
+                )
+            else:
+                logger.info("Request cancelled. The client disconnected.")
+        except Exception:
+            logger.debug(
+                "Could not end the response after an error", exc_info=True
+            )
+
+    def log_stopped(self) -> None:
+        """Log that the request stopped because the application stopped."""
+        if self.request is None:
+            logger.info("Request stopped. Transport is closed.")
+        else:
+            logger.info(
+                f"Request: {self.request.method} {self.request.url} "
+                "stopped. Transport is closed."
+            )
 
     def create_empty_request(self) -> None:
         """Create an empty request object for error handling use.
