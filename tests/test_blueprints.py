@@ -4,6 +4,8 @@ import os
 
 import pytest
 
+from sanic_routing.exceptions import FinalizationError, RouteExists
+
 from sanic.app import Sanic
 from sanic.blueprints import Blueprint
 from sanic.constants import HTTP_METHODS
@@ -884,13 +886,16 @@ def test_duplicate_blueprint(app: Sanic):
 
     app.blueprint(bp)
 
-    with pytest.raises(AssertionError) as excinfo:
+    with pytest.raises(SanicException) as excinfo:
         app.blueprint(bp1)
 
     assert str(excinfo.value) == (
         f'A blueprint with the name "{bp_name}" is already registered.  '
         "Blueprint names must be unique."
     )
+    # The rejected blueprint left no state behind.
+    assert app.blueprints[bp_name] is bp
+    assert bp1.registered is False
 
 
 def test_strict_slashes_behavior_adoption():
@@ -1150,3 +1155,312 @@ def test_blueprint_copy_returns_blueprint_with_overwritten_properties(
         for key, value in expected.items()
         if hasattr(actual, key)
     )
+
+
+# ------------------------------------------------------------ #
+# Atomic (transactional) blueprint registration
+# ------------------------------------------------------------ #
+
+
+def _make_bad_blueprint(name: str, uri: str) -> Blueprint:
+    """A blueprint whose second route duplicates the first one."""
+    bp = Blueprint(name)
+
+    @bp.get(uri)
+    async def first(request):
+        return text(f"{name}-first")
+
+    @bp.get(uri)
+    async def duplicate(request):
+        return text(f"{name}-duplicate")
+
+    return bp
+
+
+def test_batch_registration_failure_isolates_blueprints(app: Sanic):
+    bp1 = Blueprint("bp1")
+    bp3 = Blueprint("bp3")
+
+    @bp1.get("/one")
+    async def one(request):
+        return text("one")
+
+    @bp3.get("/three")
+    async def three(request):
+        return text("three")
+
+    bad = _make_bad_blueprint("bad", "/two")
+
+    with pytest.raises(RouteExists):
+        app.blueprint([bp1, bad, bp3])
+
+    assert "bp1" in app.blueprints
+    assert "bad" not in app.blueprints
+    assert "bp3" not in app.blueprints
+    assert bad.registered is False
+
+    _, response = app.test_client.get("/one")
+    assert response.text == "one"
+
+    _, response = app.test_client.get("/two")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/three")
+    assert response.status == 404
+
+    # An independent blueprint can still be registered afterwards.
+    app.blueprint(bp3)
+    _, response = app.test_client.get("/three")
+    assert response.text == "three"
+
+
+def test_blueprint_group_failure_isolates_blueprints(app: Sanic):
+    bp1 = Blueprint("bp1", url_prefix="/one")
+    bp3 = Blueprint("bp3", url_prefix="/three")
+
+    @bp1.get("/")
+    async def one(request):
+        return text("one")
+
+    @bp3.get("/")
+    async def three(request):
+        return text("three")
+
+    bad = Blueprint("bad", url_prefix="/two")
+
+    @bad.get("/")
+    async def first(request):
+        return text("two")
+
+    @bad.get("/")
+    async def duplicate(request):
+        return text("two-duplicate")
+
+    group = Blueprint.group(bp1, bad, bp3)
+
+    with pytest.raises(RouteExists):
+        app.blueprint(group)
+
+    assert [bp.name for bp in app._blueprint_order] == ["bp1"]
+
+    _, response = app.test_client.get("/one")
+    assert response.text == "one"
+
+    _, response = app.test_client.get("/two")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/three")
+    assert response.status == 404
+
+
+def test_failed_blueprint_removes_half_mounted_routes(app: Sanic):
+    @app.get("/other")
+    async def other(request):
+        return text("other")
+
+    bad = Blueprint("bad")
+
+    @bad.get("/first")
+    async def first(request):
+        return text("first")
+
+    @bad.get("/second")
+    async def second(request):
+        return text("second")
+
+    @bad.get("/first")
+    async def first_duplicate(request):
+        return text("first-duplicate")
+
+    with pytest.raises(RouteExists):
+        app.blueprint(bad)
+
+    assert bad.registered is False
+    assert bad.routes == []
+    assert "bad" not in app.blueprints
+
+    _, response = app.test_client.get("/first")
+    assert response.status == 404
+
+    _, response = app.test_client.get("/second")
+    assert response.status == 404
+
+
+def test_failed_blueprint_rolls_back_middleware_and_exception_handlers(
+    app: Sanic,
+):
+    class AltError(Exception):
+        pass
+
+    bad = Blueprint("bad")
+
+    @bad.middleware("request")
+    async def bad_middleware(request):
+        app.ctx.middleware_called = True
+
+    @bad.get("/bad")
+    async def bad_handler(request):
+        return text("bad")
+
+    @bad.exception(AltError)
+    async def handle_alt_error(request, exception):
+        return text("handled")
+
+    @bad.get("/bad")
+    async def bad_duplicate(request):
+        return text("bad-duplicate")
+
+    with pytest.raises(RouteExists):
+        app.blueprint(bad)
+
+    route_name = f"{app.name}.bad.bad_handler"
+    assert route_name not in app.named_request_middleware
+    assert not any(
+        key[1] == route_name
+        for key in app.error_handler.cached_handlers
+    )
+
+    @app.get("/other")
+    async def other(request):
+        return text("other")
+
+    app.ctx.middleware_called = False
+    _, response = app.test_client.get("/other")
+    assert response.text == "other"
+    assert app.ctx.middleware_called is False
+
+
+def test_failed_blueprint_rolls_back_signals_and_listeners(app: Sanic):
+    calls: list[str] = []
+    bad = Blueprint("bad")
+
+    @bad.signal("http.routing.after")
+    async def bad_signal(handler):
+        calls.append("signal")
+
+    @bad.listener("after_server_start")
+    def bad_listener(app, loop):
+        calls.append("listener")
+
+    @bad.get("/bad")
+    async def bad_handler(request):
+        return text("bad")
+
+    @bad.get("/bad")
+    async def bad_duplicate(request):
+        return text("bad-duplicate")
+
+    with pytest.raises(RouteExists):
+        app.blueprint(bad)
+
+    assert "http.routing.after" not in app.signal_router.name_index
+    assert bad_listener not in app.listeners["after_server_start"]
+
+    @app.get("/other")
+    async def other(request):
+        return text("other")
+
+    _, response = app.test_client.get("/other")
+    assert response.text == "other"
+    assert calls == []
+
+
+def test_late_registration_failure_rolls_back_everything(app: Sanic):
+    # All artifacts are applied first; the command check raises at the end.
+    @app.get("/other")
+    async def other(request):
+        return text("other")
+
+    bp = Blueprint("late")
+
+    @bp.get("/late")
+    async def late_handler(request):
+        return text("late")
+
+    @bp.command
+    async def do_thing():
+        return None
+
+    with pytest.raises(SanicException, match="Registering commands"):
+        app.blueprint(bp)
+
+    assert bp.registered is False
+    assert "late" not in app.blueprints
+
+    _, response = app.test_client.get("/late")
+    assert response.status == 404
+
+
+def test_same_blueprint_reregistration_is_idempotent(app: Sanic):
+    bp = Blueprint("bp")
+
+    @bp.get("/bp")
+    async def bp_handler(request):
+        return text("bp")
+
+    app.blueprint(bp)
+    app.blueprint(bp)
+
+    assert len(app.router.routes) == 1
+
+    _, response = app.test_client.get("/bp")
+    assert response.text == "bp"
+
+
+def test_blueprint_deletion_after_registration_is_stable(app: Sanic):
+    bp = Blueprint("bp")
+
+    @bp.get("/bp")
+    async def bp_handler(request):
+        return text("bp")
+
+    app.blueprint(bp)
+    del app.blueprints["bp"]
+
+    # Removing the registration does not unmount the routes and does not
+    # break finalization.
+    _, response = app.test_client.get("/bp")
+    assert response.text == "bp"
+
+    bp2 = Blueprint("bp2")
+
+    @bp2.get("/bp2")
+    async def bp2_handler(request):
+        return text("bp2")
+
+    app.blueprint(bp2)
+    _, response = app.test_client.get("/bp2")
+    assert response.text == "bp2"
+
+
+def test_startup_registration_failure_is_stable():
+    app = Sanic("startup-registration-failure")
+    bad = _make_bad_blueprint("bad", "/bad")
+
+    @app.listener("before_server_start")
+    async def register_bad(app, loop):
+        app.blueprint(bad)
+
+    with pytest.raises(RouteExists):
+        app.test_client.get("/bad")
+
+    assert "bad" not in app.blueprints
+    assert bad.registered is False
+
+
+def test_startup_fails_when_only_blueprint_fails():
+    # With no independently registered routes, an application whose only
+    # blueprint fails cannot finalize and must fail to start.
+    test_mode = Sanic.test_mode
+    Sanic.test_mode = False
+    try:
+        app = Sanic("only-blueprint-fails")
+        bad = _make_bad_blueprint("bad", "/bad")
+
+        with pytest.raises(RouteExists):
+            app.blueprint(bad)
+
+        with pytest.raises(FinalizationError):
+            app.finalize()
+    finally:
+        Sanic.test_mode = test_mode

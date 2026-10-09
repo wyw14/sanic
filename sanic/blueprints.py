@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, MutableSequence, Sequence
 from copy import deepcopy
 from functools import partial, wraps
@@ -66,6 +66,83 @@ def lazy(func, as_decorator=True):
         return wrapper if as_decorator else wrapper(pass_handler)
 
     return decorator
+
+
+_ROUTER_POOLS = ("static_routes", "dynamic_routes", "regex_routes")
+
+
+def _snapshot_router(router) -> dict[str, Any]:
+    """Capture the mutable routing state so that it can be restored.
+
+    Args:
+        router: A ``sanic_routing`` router instance.
+
+    Returns:
+        A snapshot of the route groups and name index.
+    """
+    pools: dict[str, dict[Any, tuple[Any, Any]]] = {}
+    for attr in _ROUTER_POOLS:
+        pool = getattr(router, attr)
+        pools[attr] = {
+            segments: (group, group._routes)
+            for segments, group in pool.items()
+        }
+    return {
+        "pools": pools,
+        "name_index": dict(router.name_index),
+    }
+
+
+def _restore_router(router, snapshot: dict[str, Any]) -> None:
+    """Restore routing state captured by :func:`_snapshot_router`.
+
+    Args:
+        router: The router instance to restore.
+        snapshot: A snapshot returned by :func:`_snapshot_router`.
+    """
+    for attr, before in snapshot["pools"].items():
+        pool = getattr(router, attr)
+        for segments in list(pool):
+            if segments not in before:
+                del pool[segments]
+            else:
+                group, routes = before[segments]
+                if pool[segments] is not group or group._routes != routes:
+                    group._routes = routes
+                    group.finalize()
+                    pool[segments] = group
+        for segments, (group, routes) in before.items():
+            if segments not in pool:
+                group._routes = routes
+                group.finalize()
+                pool[segments] = group
+
+    name_index = router.name_index
+    before_names = snapshot["name_index"]
+    for key in list(name_index):
+        if key not in before_names:
+            del name_index[key]
+        elif name_index[key] is not before_names[key]:
+            name_index[key] = before_names[key]
+
+
+def _restore_indexed(indexed, snapshot) -> None:
+    """Restore a mapping of containers to the state in ``snapshot``.
+
+    Args:
+        indexed: The current mapping.
+        snapshot: A mapping of keys to copies of the original containers.
+    """
+    for key in list(indexed):
+        if key not in snapshot:
+            del indexed[key]
+        elif list(indexed[key]) != list(snapshot[key]):
+            container = indexed[key]
+            container.clear()
+            container.extend(snapshot[key])
+    for key, container in snapshot.items():
+        if key not in indexed:
+            indexed[key] = type(container)(container)
 
 
 class Blueprint(BaseSanic):
@@ -332,6 +409,98 @@ class Blueprint(BaseSanic):
 
     def register(self, app, options):
         """Register the blueprint to the sanic app.
+
+        Registration is atomic: if any route, static, middleware, exception
+        handler, listener, or signal cannot be applied, all of the changes
+        made while registering this blueprint are rolled back. The blueprint
+        is then indistinguishable from one that was never registered, and
+        none of its handlers can be invoked. Blueprints registered
+        successfully beforehand are not affected.
+
+        Args:
+            app (Sanic): Sanic app to register the blueprint to.
+            options (dict): Options to be passed to the blueprint.
+        """
+        snapshot = self._snapshot(app)
+        try:
+            self._register(app, options)
+        except BaseException:
+            self._rollback(app, snapshot)
+            raise
+
+    def _snapshot(self, app) -> dict[str, Any]:
+        """Capture application and blueprint state before registration.
+
+        Args:
+            app (Sanic): Sanic app that the blueprint is registering to.
+
+        Returns:
+            A snapshot used to roll back the registration.
+        """
+        return {
+            "router": _snapshot_router(app.router),
+            "signal_router": _snapshot_router(app.signal_router),
+            "cached_handlers": set(app.error_handler.cached_handlers),
+            "named_request": {
+                key: deque(value)
+                for key, value in app.named_request_middleware.items()
+            },
+            "named_response": {
+                key: deque(value)
+                for key, value in app.named_response_middleware.items()
+            },
+            "listeners": {
+                key: list(value) for key, value in app.listeners.items()
+            },
+            "websocket_enabled": app.websocket_enabled,
+            "future_registry": set(app._future_registry),
+            "apps": set(self._apps),
+            "routes": list(self.routes),
+            "websocket_routes": list(self.websocket_routes),
+            "middlewares": list(self.middlewares),
+            "exceptions": list(self.exceptions),
+            "bp_listeners": dict(self.listeners),
+        }
+
+    def _rollback(self, app, snapshot: dict[str, Any]) -> None:
+        """Undo all of the changes made during a failed registration.
+
+        Args:
+            app (Sanic): Sanic app that the blueprint failed to register on.
+            snapshot: A snapshot returned by :meth:`_snapshot`.
+        """
+        _restore_router(app.router, snapshot["router"])
+        _restore_router(app.signal_router, snapshot["signal_router"])
+
+        cached_handlers = app.error_handler.cached_handlers
+        for key in list(cached_handlers):
+            if key not in snapshot["cached_handlers"]:
+                del cached_handlers[key]
+
+        _restore_indexed(
+            app.named_request_middleware, snapshot["named_request"]
+        )
+        _restore_indexed(
+            app.named_response_middleware, snapshot["named_response"]
+        )
+        _restore_indexed(app.listeners, snapshot["listeners"])
+
+        app.websocket_enabled = snapshot["websocket_enabled"]
+
+        future_registry = app._future_registry
+        for item in list(future_registry):
+            if item not in snapshot["future_registry"]:
+                future_registry.remove(item)
+
+        self._apps = snapshot["apps"]
+        self.routes = snapshot["routes"]
+        self.websocket_routes = snapshot["websocket_routes"]
+        self.middlewares = snapshot["middlewares"]
+        self.exceptions = snapshot["exceptions"]
+        self.listeners = snapshot["bp_listeners"]
+
+    def _register(self, app, options):
+        """Apply the blueprint to the sanic app.
 
         Args:
             app (Sanic): Sanic app to register the blueprint to.

@@ -923,21 +923,32 @@ class Sanic(
                         params["name_prefix"] = name_prefix
                 self.blueprint(item, **params)
             return
-        if blueprint.name in self.blueprints:
-            assert self.blueprints[blueprint.name] is blueprint, (
-                'A blueprint with the name "%s" is already registered.  '
-                "Blueprint names must be unique." % (blueprint.name,)
-            )
+        is_new = blueprint.name not in self.blueprints
+        if not is_new:
+            if self.blueprints[blueprint.name] is not blueprint:
+                raise SanicException(
+                    'A blueprint with the name "%s" is already registered.  '
+                    "Blueprint names must be unique." % (blueprint.name,)
+                )
         else:
             self.blueprints[blueprint.name] = blueprint
             self._blueprint_order.append(blueprint)
 
+        strict_slashes = blueprint.strict_slashes
         if (
             self.strict_slashes is not None
             and blueprint.strict_slashes is None
         ):
             blueprint.strict_slashes = self.strict_slashes
-        blueprint.register(self, options)
+        try:
+            blueprint.register(self, options)
+        except BaseException:
+            if is_new:
+                self.blueprints.pop(blueprint.name, None)
+                with suppress(ValueError):
+                    self._blueprint_order.remove(blueprint)
+            blueprint.strict_slashes = strict_slashes
+            raise
 
     def url_for(self, view_name: str, **kwargs):
         """Build a URL based on a view name and the values provided.
