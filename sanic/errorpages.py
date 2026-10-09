@@ -330,13 +330,25 @@ def exception_response(
     base: t.Type[BaseRenderer],
     renderer: t.Optional[t.Type[BaseRenderer]] = None,
 ) -> HTTPResponse:
-    """Render a response for the default FALLBACK exception handler."""
-    if not renderer:
-        mt = guess_mime(request, fallback)
-        renderer = RENDERERS_BY_CONTENT_TYPE.get(mt, base)
+    """Render a response for the default FALLBACK exception handler.
 
-    renderer = t.cast(t.Type[BaseRenderer], renderer)
-    return renderer(request, exception, debug).render()
+    A single renderer is chosen based upon the request format preference.
+    If format negotiation or the selected renderer fails, a stable default
+    error is returned instead of propagating the failure.
+    """
+    try:
+        if not renderer:
+            mt = guess_mime(request, fallback)
+            renderer = RENDERERS_BY_CONTENT_TYPE.get(mt, base)
+
+        renderer = t.cast(t.Type[BaseRenderer], renderer)
+        return renderer(request, exception, debug).render()
+    except Exception:
+        # The negotiated renderer failed: commit one stable default error.
+        try:
+            return base(request, exception, debug).render()
+        except Exception:
+            return text(FALLBACK_TEXT, FALLBACK_STATUS)
 
 
 def guess_mime(req: Request, fallback: str) -> str:

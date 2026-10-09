@@ -28,3 +28,22 @@ class HTTP(IntEnum):
     def display(self) -> str:
         value = 1.1 if self.value == 1 else self.value
         return f"HTTP/{value}"
+
+
+class Outcome(Enum):
+    """Enum for representing the outcome of sending a response
+
+    Keeps the three possible results of an exception-response attempt
+    distinguishable:
+
+    | ``RESPONSED``  The (error) response was committed to the client.
+    | ``FALLBACK``  Normal error handling failed; a single stable fallback
+        response was committed.
+    | ``DISCONNECTED``  The client had already disconnected; nothing was
+        committed and handlers were not re-invoked.
+    |
+    """
+
+    RESPONSED = 0
+    FALLBACK = 1
+    DISCONNECTED = 2

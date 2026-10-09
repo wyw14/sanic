@@ -129,18 +129,21 @@ class Http(Stream, metaclass=TouchUpMeta):
                 if self.stage is Stage.RESPONSE:
                     await self.response.send(end_stream=True)
             except CancelledError as exc:
-                # Write an appropriate response before exiting
-                if not self.protocol.transport:
-                    logger.info(
-                        f"Request: {self.request.method} {self.request.url} "
-                        "stopped. Transport is closed."
-                    )
+                # If the client disconnected there is nobody to respond to.
+                # Timeouts (self.exception) still get an error response.
+                conn_info = self.protocol.conn_info
+                if conn_info is None or conn_info.lost:
+                    if self.request is not None:
+                        logger.info(
+                            f"Request: {self.request.method} "
+                            f"{self.request.url} stopped. "
+                            "Transport is closed."
+                        )
+                    self.exception = None
+                    self.keep_alive = False
                     return
-                e = (
-                    RequestCancelled()
-                    if self.protocol.conn_info.lost
-                    else (self.exception or exc)
-                )
+
+                e = self.exception or exc
                 self.exception = None
                 self.keep_alive = False
                 await self.error_response(e)
@@ -439,8 +442,24 @@ class Http(Stream, metaclass=TouchUpMeta):
                 await app.handle_exception(
                     self.request, exception, request_middleware
                 )
-            except Exception as e:
-                await app.handle_exception(self.request, e, False)
+            except RequestCancelled:
+                # The client disconnected; there is nobody to respond to
+                self.keep_alive = False
+            except Exception:
+                # Last resort: one stable default, handlers not re-invoked
+                from sanic.errorpages import FALLBACK_STATUS, FALLBACK_TEXT
+
+                self.keep_alive = False
+                error_logger.exception(
+                    "Failed to send an error response while handling "
+                    "an exception"
+                )
+                try:
+                    fallback = text(FALLBACK_TEXT, FALLBACK_STATUS)
+                    self.respond(fallback)
+                    await fallback.send(end_stream=True)
+                except Exception:
+                    ...
 
     def create_empty_request(self) -> None:
         """Create an empty request object for error handling use.
@@ -611,6 +630,11 @@ class Http(Stream, metaclass=TouchUpMeta):
         # Disconnect any earlier but unused response object
         if self.response is not None:
             self.response.stream = None
+
+        # A previous attempt may have aborted while formatting the header,
+        # leaving the send func unset. Re-arm it so the new response commits
+        # its status and headers exactly once.
+        self.response_func = self.http1_response_header
 
         # Connect and return the response
         self.response, response.stream = response, self

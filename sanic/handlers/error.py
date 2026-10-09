@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from sanic.errorpages import BaseRenderer, TextRenderer, exception_response
+from sanic.errorpages import (
+    FALLBACK_STATUS,
+    BaseRenderer,
+    TextRenderer,
+    exception_response,
+    guess_mime,
+)
 from sanic.exceptions import ServerError
 from sanic.log import error_logger
 from sanic.models.handler_types import RouteHandler
 from sanic.request.types import Request
-from sanic.response import text
+from sanic.response import json, text
 from sanic.response.types import HTTPResponse
 
 
@@ -128,7 +134,7 @@ class ErrorHandler:
                 response = handler(request, exception)
             if response is None:
                 response = self.default(request, exception)
-        except Exception:
+        except Exception as e:
             try:
                 url = repr(request.url)
             except AttributeError:  # no cov
@@ -136,13 +142,55 @@ class ErrorHandler:
             response_message = (
                 'Exception raised in exception handler "%s" for uri: %s'
             )
-            error_logger.exception(response_message, handler.__name__, url)
-
+            handler_name = getattr(handler, "__name__", "default")
+            error_logger.exception(response_message, handler_name, url)
+            # Stable fallback message; the failed handler is not invoked again.
             if self.debug:
-                return text(response_message % (handler.__name__, url), 500)
+                stable = ServerError(response_message % (handler_name, url))
             else:
-                return text("An error occurred while handling an error", 500)
+                stable = ServerError(
+                    "An error occurred while handling an error"
+                )
+            return self.fallback(request, stable)
         return response
+
+    def fallback(self, request: Request, exception: Exception) -> HTTPResponse:
+        """Provide one stable error response when normal handling failed.
+
+        A single representation is selected by the request format
+        preference: a JSON client receives the stable message as JSON,
+        while other clients receive it as plain text (the established
+        fallback). The response is built once and never re-invokes
+        handlers.
+
+        Args:
+            request (Request): Instance of the request.
+            exception (Exception): The stable exception to render.
+
+        Returns:
+            HTTPResponse: A stable error response.
+        """  # noqa: E501
+        message = str(exception)
+        status = getattr(exception, "status_code", FALLBACK_STATUS)
+        mime = self._preferred_mime(request)
+        if mime == "application/json":
+            return json(
+                {
+                    "description": "Internal Server Error",
+                    "status": status,
+                    "message": message,
+                },
+                status=status,
+            )
+        return text(message, status)
+
+    def _preferred_mime(self, request: Request) -> str:
+        """Safely resolve the client's preferred response MIME."""
+        try:
+            fallback = request.app.config.FALLBACK_ERROR_FORMAT
+            return guess_mime(request, fallback)
+        except Exception:  # no cov
+            return ""
 
     def default(self, request: Request, exception: Exception) -> HTTPResponse:
         """Provide a default behavior for the objects of ErrorHandler.

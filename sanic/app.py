@@ -53,6 +53,7 @@ from sanic.compat import OS_IS_WINDOWS, enable_windows_color_support
 from sanic.config import SANIC_PREFIX, Config
 from sanic.exceptions import (
     BadRequest,
+    RequestCancelled,
     SanicException,
     ServerError,
     URLBuildError,
@@ -60,6 +61,7 @@ from sanic.exceptions import (
 from sanic.handlers import ErrorHandler
 from sanic.helpers import Default, _default
 from sanic.http import Stage
+from sanic.http.constants import Outcome
 from sanic.log import LOGGING_CONFIG_DEFAULTS, error_logger, logger
 from sanic.logging.deprecation import deprecation
 from sanic.logging.setup import setup_logging
@@ -1138,12 +1140,17 @@ class Sanic(
         request: Request,
         exception: BaseException,
         run_middleware: bool = True,
-    ) -> None:  # no cov
+    ) -> Outcome | None:  # no cov
         """A handler that catches specific exceptions and outputs a response.
 
         .. note::
             This method is typically used internally, and you should not need
             to call it directly.
+
+        A single representation is rendered according to the request format
+        preference and the status and headers are committed exactly once.
+        The returned :class:`Outcome` distinguishes between a committed
+        (fallback) response and a client that had already disconnected.
 
         Args:
             request (Request): The current request object.
@@ -1198,6 +1205,15 @@ class Sanic(
                 )
             return
 
+        # If the client already disconnected, do not render or commit and
+        # do not invoke any (error) handler again.
+        if self._client_is_lost(request):
+            logger.info(
+                f"Request: {request.method} {request.url} stopped. "
+                "Transport is closed."
+            )
+            return Outcome.DISCONNECTED
+
         # -------------------------------------------- #
         # Request Middleware
         # -------------------------------------------- #
@@ -1210,7 +1226,11 @@ class Sanic(
                     request, middleware
                 )
             except Exception as e:
+                # The recursive call handles everything; do not fall through
+                # to render the original exception again.
                 return await self.handle_exception(request, e, False)
+
+        outcome = Outcome.RESPONSED
         # No middleware results
         if not response:
             try:
@@ -1218,29 +1238,37 @@ class Sanic(
                 if isawaitable(response):
                     response = await response
             except Exception as e:
+                # Error handling itself failed: one stable fallback rendered
+                # by format preference, handlers are not invoked again.
                 if isinstance(e, SanicException):
-                    response = self.error_handler.default(request, e)
+                    self.error_handler.log(request, e)
+                    stable = e
                 elif self.debug:
-                    response = HTTPResponse(
-                        (
-                            f"Error while handling error: {e}\n"
-                            f"Stack: {format_exc()}"
-                        ),
-                        status=500,
+                    stable = ServerError(
+                        f"Error while handling error: {e}\n"
+                        f"Stack: {format_exc()}"
                     )
                 else:
-                    response = HTTPResponse(
-                        "An error occurred while handling an error", status=500
+                    stable = ServerError(
+                        "An error occurred while handling an error"
                     )
+                response = self.error_handler.fallback(request, stable)
+                outcome = Outcome.FALLBACK
+
         if response is not None:
             try:
                 request.reset_response()
                 response = await request.respond(response)
+            except RequestCancelled:
+                return Outcome.DISCONNECTED
             except BaseException:
-                # Skip response middleware
+                # Skip response middleware and commit directly, once.
                 if request.stream:
                     request.stream.respond(response)
-                await response.send(end_stream=True)
+                try:
+                    await response.send(end_stream=True)
+                except RequestCancelled:
+                    return Outcome.DISCONNECTED
                 raise
         else:
             if request.stream:
@@ -1257,7 +1285,10 @@ class Sanic(
                     "response": response,
                 },
             )
-            await response.send(end_stream=True)
+            try:
+                await response.send(end_stream=True)
+            except RequestCancelled:
+                return Outcome.DISCONNECTED
         elif isinstance(response, ResponseStream):
             resp = await response(request)
             await self.dispatch(
@@ -1273,6 +1304,20 @@ class Sanic(
             raise ServerError(
                 f"Invalid response type {response!r} (need HTTPResponse)"
             )
+        return outcome
+
+    @staticmethod
+    def _client_is_lost(request: Request) -> bool:
+        """Whether the client connection is known to be gone."""
+        conn_info = getattr(request, "conn_info", None)
+        if conn_info is not None and conn_info.lost:
+            return True
+        protocol = getattr(request, "transport", None)
+        transport = getattr(protocol, "transport", None)
+        if transport is None:
+            return False
+        is_closing = getattr(transport, "is_closing", None)
+        return bool(is_closing and is_closing())
 
     async def handle_request(self, request: Request) -> None:  # no cov
         """Handles a request by dispatching it to the appropriate handler.
@@ -1428,9 +1473,13 @@ class Sanic(
             raise
         except Exception as e:
             # Response Generation Failed
-            await self.handle_exception(
+            outcome = await self.handle_exception(
                 request, e, run_middleware=run_middleware
             )
+            if outcome is Outcome.DISCONNECTED:
+                # The client was gone; surface cancellation so the protocol
+                # layer closes the connection without rendering again.
+                raise RequestCancelled
 
     async def _websocket_handler(
         self, handler, request, *args, subprotocols=None, **kwargs

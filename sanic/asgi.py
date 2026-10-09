@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import warnings
 
+from asyncio import CancelledError
+
 from typing import TYPE_CHECKING
 
 from sanic.compat import Header
@@ -256,8 +258,15 @@ class ASGIApp:
         try:
             self.stage = Stage.HANDLER
             await self.sanic_app.handle_request(self.request)
+        except CancelledError:
+            # The client disconnected; there is nobody to respond to.
+            raise
         except Exception as e:
+            # handle_exception is fail-safe and commits at most once.
             try:
                 await self.sanic_app.handle_exception(self.request, e)
-            except Exception as exc:
-                await self.sanic_app.handle_exception(self.request, exc, False)
+            except Exception:
+                error_logger.exception(
+                    "Failed to send an error response while handling "
+                    "an exception"
+                )
