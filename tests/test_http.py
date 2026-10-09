@@ -30,6 +30,13 @@ def test_app(app: Sanic):
         data = [part.decode("utf-8") async for part in request.stream]
         return json(data)
 
+    @app.post("/trailer", stream=True)
+    async def trailer_handler(request):
+        data = [part.decode("utf-8") async for part in request.stream]
+        return json(
+            {"data": data, "checksum": request.headers.get("x-checksum")}
+        )
+
     return app
 
 
@@ -43,7 +50,7 @@ def runner(test_app: Sanic, port):
 
 @pytest.fixture
 def client(runner: ReusableClient):
-    client = namedtuple("Client", ("raw", "send", "recv"))
+    client = namedtuple("Client", ("raw", "send", "recv", "shutdown"))
 
     raw = RawClient(runner.host, runner.port)
     runner._run(raw.connect())
@@ -59,7 +66,12 @@ def client(runner: ReusableClient):
         method = raw.recv_until if "until" in kwargs else raw.recv
         return runner._run(method(**kwargs))
 
-    yield client(raw, send, recv)
+    def shutdown():
+        nonlocal runner
+        nonlocal raw
+        runner._run(raw.shutdown())
+
+    yield client(raw, send, recv, shutdown)
 
     runner._run(raw.close())
 
@@ -216,6 +228,27 @@ def test_smuggle(client):
     assert b"Bad Request" in body
 
 
+def test_bad_chunk_size_blocks_pipelined_request(client):
+    """An illegal chunk size aborts the request; the bytes already in the
+    buffer must never be parsed as a second (smuggled) request."""
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"ZZ\r\n"
+        b"GET / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"\r\n"
+    )
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"400 Bad Request" in response
+    assert b"111122223333444455556666777788889999" not in response
+
+
 def test_chunked_trailer_baseline(client):
     client.send(_chunked_trailer_payload())
 
@@ -252,12 +285,14 @@ def test_chunked_trailer_smuggle_offset_control(client):
     assert b"Method :GET not allowed" not in response
 
 
-def test_chunked_trailer_rejected(client):
+def test_chunked_trailer_accepted(client):
+    """A properly terminated trailer field is processed as a header."""
     client.send(
-        b"POST /upload HTTP/1.1\r\n"
+        b"POST /trailer HTTP/1.1\r\n"
         b"Host: localhost\r\n"
         b"Connection: keep-alive\r\n"
         b"Transfer-Encoding: chunked\r\n"
+        b"Trailer: X-Checksum\r\n"
         b"\r\n"
         b"3\r\nfoo\r\n"
         b"0\r\n"
@@ -267,8 +302,185 @@ def test_chunked_trailer_rejected(client):
 
     response = client.recv()
     assert response.count(b"HTTP/1.1") == 1
+    assert b"200 OK" in response
+    _, body = response.rsplit(b"\r\n\r\n", 1)
+    assert stdjson.loads(body) == {
+        "data": ["foo"],
+        "checksum": "deadbeef",
+    }
+
+
+def test_chunked_trailer_accepted_without_declaration(client):
+    """A trailer field is consumed even without a Trailer declaration."""
+    client.send(
+        b"POST /trailer HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"3\r\nfoo\r\n"
+        b"0\r\n"
+        b"X-Checksum: cafebabe\r\n"
+        b"\r\n"
+    )
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"200 OK" in response
+    _, body = response.rsplit(b"\r\n\r\n", 1)
+    assert stdjson.loads(body) == {
+        "data": ["foo"],
+        "checksum": "cafebabe",
+    }
+
+
+@pytest.mark.parametrize(
+    "trailer_section",
+    (
+        b"NotAHeaderLine\r\n\r\n",
+        b"Host: evil.example\r\n\r\n",
+        b"X-Bad : value\r\n\r\n",
+        b"\xff: value\r\n\r\n",
+    ),
+)
+def test_chunked_trailer_malformed(trailer_section, client):
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"3\r\nfoo\r\n"
+        b"0\r\n" + trailer_section
+    )
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
     assert b"400 Bad Request" in response
     assert b"200 OK" not in response
+
+
+def test_chunked_truncated_mid_chunk(client):
+    """Connection ending inside a declared chunk is a clear 400."""
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"5\r\nabc"
+    )
+    client.shutdown()
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"400 Bad Request" in response
+
+
+def test_chunked_truncated_before_chunk_size(client):
+    """Connection ending before a chunk-size line ends is a clear 400."""
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"xyz"
+    )
+    client.shutdown()
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"400 Bad Request" in response
+
+
+def test_chunked_truncated_trailer(client):
+    """An unterminated trailer section is a client error, never a reset."""
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"3\r\nfoo\r\n"
+        b"0\r\n"
+        b"X-Foo: bar\r\n"
+    )
+    client.shutdown()
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"400 Bad Request" in response
+
+
+def test_chunked_empty_body(client):
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+        b"0\r\n\r\n"
+    )
+
+    response = client.recv()
+    headers, body = response.rsplit(b"\r\n\r\n", 1)
+    assert b"200 OK" in headers
+    assert stdjson.loads(body) == []
+
+
+def test_client_close_idle_is_silent(client):
+    """Closing a connection without a pending request yields nothing."""
+    client.shutdown()
+
+    assert client.recv() == b""
+
+
+def test_content_length_truncated(client):
+    """A fixed-length body cut off by EOF is also a clear 400."""
+    client.send(
+        b"POST /upload HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Content-Length: 10\r\n"
+        b"\r\n"
+        b"abc"
+    )
+    client.shutdown()
+
+    response = client.recv()
+    assert response.count(b"HTTP/1.1") == 1
+    assert b"400 Bad Request" in response
+
+
+def test_chunked_proxy_forwarded_with_trailers(client):
+    """A proxy forwarding chunked bodies, extensions and trailers verbatim
+    must succeed; the following pipelined request starts from a clean
+    parser state and never sees trailer bytes from the first request."""
+    client.send(
+        b"POST /trailer HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Trailer: X-Checksum\r\n"
+        b"\r\n"
+        b"3;foo=bar\r\nfoo\r\n"
+        b"0\r\n"
+        b"X-Checksum: deadbeef\r\n"
+        b"X-Proxy: sanic-test\r\n"
+        b"\r\n"
+        b"GET / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"\r\n"
+    )
+
+    response = client.recv()
+    messages = response.split(b"HTTP/1.1")[1:]
+    assert len(messages) == 2
+    assert b"200 OK" in messages[0]
+    assert b"deadbeef" in messages[0]
+    assert b"200 OK" in messages[1]
+    assert b"deadbeef" not in messages[1]
+    assert b"x-proxy" not in messages[1].lower()
 
 
 def test_chunked_trailer_smuggle_chunk_extension(client):

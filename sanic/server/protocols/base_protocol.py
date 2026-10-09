@@ -31,6 +31,7 @@ class SanicProtocol(asyncio.Protocol):
         "_task",
         "_unix",
         "_data_received",
+        "_eof",
     )
 
     def __init__(
@@ -56,6 +57,7 @@ class SanicProtocol(asyncio.Protocol):
         self._time = 0.0  # type: float
         self._task: asyncio.Task | None = None
         self._data_received = asyncio.Event()
+        self._eof = False
 
     @property
     def ctx(self):
@@ -80,6 +82,11 @@ class SanicProtocol(asyncio.Protocol):
         """
         self.transport.resume_reading()
         self._data_received.clear()
+        if self._eof:
+            # The peer shut down its write side. Nothing more will ever
+            # arrive, so don't wait on the event. Callers decide whether
+            # the truncated message is a client error or a clean close.
+            return
         await self._data_received.wait()
 
     def close(self, timeout: float | None = None):

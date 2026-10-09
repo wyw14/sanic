@@ -45,6 +45,20 @@ class Http(Stream, metaclass=TouchUpMeta):
 
     HEADER_CEILING = 16_384
     HEADER_MAX_SIZE = 0
+    # Maximum length of a single chunk-size line (chunk extensions included)
+    CHUNK_SIZE_LINE_MAX = 64
+    # Framing and routing fields that RFC 9112 forbids in a trailer-part
+    TRAILER_FORBIDDEN_FIELDS = frozenset(
+        {
+            "content-encoding",
+            "content-length",
+            "content-range",
+            "content-type",
+            "host",
+            "trailer",
+            "transfer-encoding",
+        }
+    )
     __touchup__ = (
         "http1_request_header",
         "http1_response_header",
@@ -110,6 +124,12 @@ class Http(Stream, metaclass=TouchUpMeta):
             # Wait for incoming bytes (in IDLE stage)
             if not self.recv_buffer:
                 await self._receive_more()
+                if not self.recv_buffer and self.protocol._eof:
+                    # The client closed a reusable connection without
+                    # sending another request. This is a normal end to the
+                    # connection, not a malformed request: exit silently.
+                    self.keep_alive = False
+                    return
             self.stage = Stage.REQUEST
             try:
                 # Receive and handle a request
@@ -191,6 +211,8 @@ class Http(Stream, metaclass=TouchUpMeta):
                 break
 
             await self._receive_more()
+            if self.protocol._eof and buf.find(b"\r\n\r\n") == -1:
+                raise BadRequest("Bad Request")
 
         if pos >= self.HEADER_MAX_SIZE:
             raise PayloadTooLarge("Request header exceeds the size limit")
@@ -511,60 +533,18 @@ class Http(Stream, metaclass=TouchUpMeta):
 
         # Receive request body chunk
         buf = self.recv_buffer
+
         if self.request_bytes_left == 0 and self.request_body == "chunked":
-            # Process a chunk header: \r\n<size>[;<chunk extensions>]\r\n
-            while True:
-                pos = buf.find(b"\r\n", 3)
+            size = await self._read_chunk_size(buf)
 
-                if pos != -1:
-                    break
-
-                if len(buf) > 64:
-                    self.keep_alive = False
-                    raise BadRequest("Bad chunked encoding")
-
-                await self._receive_more()
-
-            try:
-                raw = buf[2:pos].split(b";", 1)[0].decode()
-                size = self._safe_int(raw, 16)
-            except Exception:
-                self.keep_alive = False
-                raise BadRequest("Bad chunked encoding")
-
-            if size <= 0:
+            if size == 0:
+                # Consume and process the trailer-part so that the
+                # request is only complete when it is properly ended.
+                await self._read_chunked_trailer(buf)
                 self.request_body = None
-
-                if size < 0:
-                    self.keep_alive = False
-                    raise BadRequest("Bad chunked encoding")
-
-                # Consume the leading CRLF, the terminating size line and
-                # the CRLF that follows it.
-                del buf[: pos + 2]
-
-                # Only the empty line that ends the (empty) trailer section
-                # may follow. Wait for it to arrive.
-                while len(buf) < 2:
-                    await self._receive_more()
-
-                # Reject any trailer-part. Leaving trailer bytes in the
-                # buffer would let them be reparsed as a smuggled request on
-                # this keep-alive connection.
-                if buf[:2] != b"\r\n":
-                    self.keep_alive = False
-                    raise BadRequest("Bad chunked encoding")
-
-                # Consume the final empty line. Anything after it is a
-                # legitimately pipelined next request.
-                del buf[:2]
-                return None
-
-            # Remove CRLF, chunk size and the CRLF that follows
-            del buf[: pos + 2]
-
-            self.request_bytes_left = size
-            self.request_bytes += size
+            else:
+                self.request_bytes_left = size
+                self.request_bytes += size
 
         # Request size limit
         if self.request_bytes > self.request_max_size:
@@ -579,6 +559,13 @@ class Http(Stream, metaclass=TouchUpMeta):
         # At this point we are good to read/return up to request_bytes_left
         if not buf:
             await self._receive_more()
+            if not buf and self.protocol._eof:
+                # The client went away before the declared body (or
+                # chunk) was fully transferred. That is a client error,
+                # distinct from closing an idle connection: answer with
+                # a clear 400 and drop the connection.
+                self.keep_alive = False
+                raise BadRequest("Incomplete request body")
 
         data = bytes(buf[: self.request_bytes_left])
         size = len(data)
@@ -594,6 +581,123 @@ class Http(Stream, metaclass=TouchUpMeta):
         )
 
         return data
+
+    async def _read_chunk_size(self, buf: bytearray) -> int:
+        """Parse one chunk header: ``CRLF <size>[;<chunk-ext>] CRLF``.
+
+        The leading CRLF terminates the previous chunk's data (or is the
+        CRLF left over from the header section for the first chunk).
+        Returns the declared chunk size; ``0`` marks the final chunk.
+        """
+        # Wait for the CRLF that begins the chunk-size line.
+        while len(buf) < 2:
+            if self.protocol._eof:
+                self.keep_alive = False
+                raise BadRequest("Bad chunked encoding")
+            await self._receive_more()
+
+        if buf[:2] != b"\r\n":
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+
+        # Wait for the CRLF ending the chunk-size line.
+        while True:
+            pos = buf.find(b"\r\n", 2)
+            if pos != -1:
+                break
+            if len(buf) > self.CHUNK_SIZE_LINE_MAX:
+                self.keep_alive = False
+                raise BadRequest("Bad chunked encoding")
+            if self.protocol._eof:
+                self.keep_alive = False
+                raise BadRequest("Bad chunked encoding")
+            await self._receive_more()
+
+        try:
+            raw = bytes(buf[2:pos]).split(b";", 1)[0].strip()
+            size = self._safe_int(raw.decode("ascii"), 16)
+        except Exception:
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+
+        # Consume the leading CRLF, the chunk-size line and its CRLF.
+        del buf[: pos + 2]
+
+        return size
+
+    async def _read_chunked_trailer(self, buf: bytearray) -> None:
+        """Consume the trailer-part following the zero-size chunk.
+
+        ``trailer-part = *( field-line CRLF ) CRLF``
+
+        Every trailer field is parsed as a header field and, when
+        allowed, added to the request headers. The whole section is
+        always consumed up to and including the terminating empty line,
+        so no trailer byte can ever be reparsed as a pipelined request
+        on this keep-alive connection.
+        """
+        trailer_bytes = 0
+
+        while True:
+            while len(buf) < 2:
+                if self.protocol._eof:
+                    self.keep_alive = False
+                    raise BadRequest("Bad chunked encoding")
+                await self._receive_more()
+
+            # The empty line ending the (possibly empty) trailer section.
+            if buf[:2] == b"\r\n":
+                del buf[:2]
+                return
+
+            # Wait for the CRLF ending this trailer field line.
+            pos = buf.find(b"\r\n")
+            while pos == -1:
+                if trailer_bytes + len(buf) > self.HEADER_CEILING:
+                    self.keep_alive = False
+                    raise BadRequest("Bad chunked encoding")
+                if self.protocol._eof:
+                    self.keep_alive = False
+                    raise BadRequest("Bad chunked encoding")
+                await self._receive_more()
+                pos = buf.find(b"\r\n")
+
+            line = bytes(buf[:pos])
+            del buf[: pos + 2]
+            trailer_bytes += pos + 2
+            if trailer_bytes > self.HEADER_CEILING:
+                self.keep_alive = False
+                raise BadRequest("Bad chunked encoding")
+
+            self._consume_trailer_field(line)
+
+    def _consume_trailer_field(self, line: bytes) -> None:
+        """Validate one trailer field line and attach it to the request."""
+        try:
+            text = line.decode("ascii")
+        except UnicodeDecodeError:
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+
+        if ":" not in text:
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+
+        name, value = text.split(":", 1)
+        # A field name consists of token characters only: no whitespace.
+        if not name or any(ch.isspace() for ch in name):
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+        name = name.lower()
+
+        # RFC 9112: framing and routing fields MUST NOT be carried in
+        # trailers. Accepting them could desync security decisions or
+        # duplicate fields such as Host or Content-Length.
+        if name in self.TRAILER_FORBIDDEN_FIELDS:
+            self.keep_alive = False
+            raise BadRequest("Bad chunked encoding")
+
+        self.request.headers.add(name, value.lstrip())
 
     # Response methods
 

@@ -323,6 +323,20 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
         except Exception:
             error_logger.exception("protocol.data_received")
 
+    def eof_received(self) -> bool:
+        """The client shut down its write side of the connection.
+
+        Keep the transport open (half-close) instead of letting the event
+        loop tear it down and cancel the connection task. This lets the
+        HTTP/1.1 parser notice the EOF, answer a truncated request body
+        with an explicit ``400 Bad Request`` response, and close the
+        connection itself afterwards. An idle connection simply ends.
+        """
+        self._eof = True
+        if self._data_received:
+            self._data_received.set()
+        return True
+
 
 class Http3Protocol(HttpProtocolMixin, ConnectionProtocol):  # type: ignore
     HTTP_CLASS = Http3

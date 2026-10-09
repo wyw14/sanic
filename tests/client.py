@@ -1,4 +1,5 @@
 import asyncio
+import socket
 
 from textwrap import dedent
 from typing import AnyStr
@@ -21,6 +22,14 @@ class RawClient:
     async def close(self):
         self.writer.close()
         await self.writer.wait_closed()
+
+    async def shutdown(self):
+        """Half-close the write side, signalling EOF to the server while
+        keeping the read side open so its response can still be received."""
+        await self.writer.drain()
+        sock = self.writer.transport.get_extra_info("socket")
+        if sock is not None:
+            sock.shutdown(socket.SHUT_WR)
 
     async def send(self, message: AnyStr):
         if isinstance(message, str):
